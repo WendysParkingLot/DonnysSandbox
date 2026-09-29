@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Babylon.js render check</title>
+<script>
+// Startup profiler (build step 1 diagnostics). Times WebGL calls, and each
+// shader program's compile and link, per stage of the startup probe
+// (scripts/debug/startup_probe.gd), and counts programs never used to draw.
+// The debug overlay reads its totals. Written without double quotes or
+// backslashes so it can sit verbatim in export_presets.cfg.
+(() => {
+	const Gl2 = window.WebGL2RenderingContext;
+	if (!Gl2 || window.startupProfiler) {
+		return;
+	}
+	const NEWLINE = String.fromCharCode(10);
+	const VERTEX_SHADER = 0x8B31;
+	const DRAW_CALLS = ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced', 'drawRangeElements'];
+	const keepSource = new URLSearchParams(location.search).has('glsource');
+	const records = new WeakMap(); // WebGLShader or WebGLProgram -> its record
+	const programs = [];
+	const stages = [];
+	const methods = {};
+	const totals = { programs: 0, programMs: 0 };
+	const longTasks = { count: 0, totalMs: 0, maxMs: 0 };
+	let stage = null;
+
+	const startStage = (name) => {
+		stage = { name: String(name), startMs: performance.now(), programMs: 0, glMs: 0 };
+		stages.push(stage);
+	};
+	startStage('Engine start');
+
+	// Names of the #define lines at the top of a shader, where Godot puts a
+	// variant's specialization flags, mode, and material flags.
+	const topDefines = (source) => {
+		const names = [];
+		for (const line of source.split(NEWLINE)) {
+			if (line.startsWith('#define ')) {
+				names.push(line.slice(8).trim().split(' ')[0]);
+			} else if (line.startsWith('#if') || line.startsWith('precision')) {
+				break;
+			}
+		}
+		return names;
+	};
+
+	const hooks = {
+		createShader: (gl, args, shader) => {
+			records.set(shader, { vertex: args[0] === VERTEX_SHADER, ms: 0, defines: [], glsl3: false, source: '' });
+		},
+		shaderSource: (gl, args) => {
+			const shader = records.get(args[0]);
+			if (shader !== undefined) {
+				shader.defines = topDefines(args[1]);
+				shader.glsl3 = args[1].startsWith('#version 300 es');
+				shader.source = keepSource ? args[1] : '';
+			}
+		},
+		createProgram: (gl, args, program) => {
+			records.set(program, { ms: 0, shaders: [], draws: 0, stage: '' });
+		},
+		attachShader: (gl, args) => {
+			const program = records.get(args[0]);
+			const shader = records.get(args[1]);
+			if (program !== undefined && shader !== undefined) {
+				program.shaders.push(shader);
+			}
+		},
+		linkProgram: (gl, args) => {
+			const program = records.get(args[0]);
+			if (program !== undefined) {
+				program.stage = stage.name;
+				programs.push(program);
+				totals.programs += 1;
+			}
+		},
+		useProgram: (gl, args) => {
+			gl.startupProfilerProgram = args[0] ? records.get(args[0]) : undefined;
+		},
+	};
+	for (const name of DRAW_CALLS) {
+		hooks[name] = (gl) => {
+			if (gl.startupProfilerProgram !== undefined) {
+				gl.startupProfilerProgram.draws += 1;
+			}
+		};
+	}
+
+	const wrap = (name, original) => {
+		const hook = hooks[name];
+		const calls = { name: name, count: 0, ms: 0 };
+		methods[name] = calls;
+		// Binding a program every frame is not part of building it.
+		const attribute = name !== 'useProgram';
+		return function (...args) {
+			const start = performance.now();
+			const result = original.apply(this, args);
+			const ms = performance.now() - start;
+			calls.count += 1;
+			calls.ms += ms;
+			stage.glMs += ms;
+			if (attribute && typeof args[0] === 'object' && args[0] !== null) {
+				const record = records.get(args[0]);
+				if (record !== undefined) {
+					record.ms += ms;
+					stage.programMs += ms;
+					totals.programMs += ms;
+				}
+			}
+			if (hook !== undefined) {
+				hook(this, args, result);
+			}
+			return result;
+		};
+	};
+	for (const name of Object.getOwnPropertyNames(Gl2.prototype)) {
+		const descriptor = Object.getOwnPropertyDescriptor(Gl2.prototype, name);
+		if (name !== 'constructor' && descriptor !== undefined && typeof descriptor.value === 'function') {
+			Gl2.prototype[name] = wrap(name, descriptor.value);
+		}
+	}
+
+	try {
+		new PerformanceObserver((list) => {
+			for (const entry of list.getEntries()) {
+				longTasks.count += 1;
+				longTasks.totalMs += entry.duration;
+				longTasks.maxMs = Math.max(longTasks.maxMs, entry.duration);
+			}
+		}).observe({ type: 'longtask', buffered: true });
+	} catch (error) {
+		// Long-task timing is optional; not every browser has it.
+	}
+
+	const shaderOf = (program, vertex) => program.shaders.find((shader) => shader.vertex === vertex);
+	window.startupProfiler = {
+		// Starts a new stage; later WebGL work counts toward it.
+		stage: startStage,
+		// Program count and compile + link time so far, as JSON.
+		summary: () => JSON.stringify(totals),
+		// Everything recorded so far, as JSON.
+		report: () => JSON.stringify({
+			nowMs: performance.now(),
+			stages: stages,
+			longTasks: longTasks,
+			methods: Object.values(methods).filter((calls) => calls.count > 0),
+			programs: programs.map((program) => {
+				const vertex = shaderOf(program, true);
+				const fragment = shaderOf(program, false);
+				return {
+					stage: program.stage,
+					ms: program.shaders.reduce((sum, shader) => sum + shader.ms, program.ms),
+					draws: program.draws,
+					glsl3: fragment !== undefined && fragment.glsl3,
+					defines: fragment !== undefined ? fragment.defines : [],
+					vertexSource: keepSource && vertex !== undefined ? vertex.source : undefined,
+					fragmentSource: keepSource && fragment !== undefined ? fragment.source : undefined,
+				};
+			}),
+		}),
+	};
+})();
+</script>
+<style>
+	html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+	canvas { display: block; width: 100vw; height: 100vh; touch-action: none; outline: none; }
+	#readout {
+		position: fixed; left: 8px; top: 8px; max-width: calc(100vw - 36px);
+		padding: 8px 10px; border-radius: 4px; background: rgba(0, 0, 0, 0.65); color: #fff;
+		font: 500 clamp(11px, 1.45vw, 20px)/1.35 system-ui, -apple-system, "Segoe UI", sans-serif;
+	}
+	#lines { white-space: pre-wrap; }
+	#buttons button { font: inherit; margin: 6px 6px 0 0; padding: 4px 12px; }
+</style>
+</head>
+<body>
+<canvas id="render"></canvas>
+<div id="readout"><div id="lines">Loading…</div><div id="buttons"></div></div>
+<script type="module" src="main.js"></script>
+</body>
+</html>
